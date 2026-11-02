@@ -147,6 +147,7 @@ public class RestartBlocking {
         @Override
         public void run() {
             while (true) {
+                boolean committed = false;
                 // make use of auto-closeables
                 try (Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
                      PreparedStatement ps = con.prepareStatement("UPDATE blocking_data SET data_value = ?, modified_by = " + task + " WHERE data_value >= ? AND data_value <= ?", ResultSet.TYPE_SCROLL_SENSITIVE, ResultSet.CONCUR_UPDATABLE)) {
@@ -154,6 +155,7 @@ public class RestartBlocking {
                     con.setAutoCommit(false);
                     con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
                     int q = 0;
+                    try {
                     while(q<num_queries_per_task) {//I want to execute num_queries_per_task update queries
                         ps.setDouble(1, (float) (rand.nextDouble()*max_value));//some value, which one is not important.
                         ps.setDouble(2, start_range[q]);
@@ -163,20 +165,25 @@ public class RestartBlocking {
                         q++;
                     }
                     con.commit();
+                    committed = true;
                     int num_finished = tasks_finished.incrementAndGet();
                     System.out.println("Done task "+task+". I am finisher number "+num_finished);
                     break; // exit loop, success
+                    } catch (SQLException e) {
+                        try {
+                            con.rollback(); // Even though we are in a try-with-resources, explicitly rolling back on exception is good practice
+                        } catch (SQLException rollbackException) {
+                            e.addSuppressed(rollbackException); // Add rollback exception to the original exception in case it doesn't succeed
+                        }
+                        throw e;
+                    }
                 } catch (SQLException e) {
+                    if (committed) { // Error after commit (probably when closing the connection), do not retry
+                        System.err.println("Task " + task + " committed successfully, but encountered an error afterwards: " + e.getMessage());
+                        break; //
+                    }
                     if (isDeadlock(e)) {
-                        long backoff = 0;
                         Logger.logError("Task " + task + " deadlock error, retrying", e);
-//                        try {
-//                            Thread.sleep(backoff);
-//                        } catch (InterruptedException ie) {
-//                            Thread.currentThread().interrupt();
-//                            Logger.logStatus("Task " + task + " interrupted during backoff, exiting.");
-//                            break;
-//                        }
                     } else {
                         System.err.println("Task " + task + " non-deadlock error: " + e.getMessage());
                         break;
