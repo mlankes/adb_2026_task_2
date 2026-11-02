@@ -1,0 +1,16 @@
+approach,finished,deadlocks,time[ms]
+blocking,23,7,8312
+blocking,27,3,4508
+blocking,15,15,14317
+blocking,23,7,7910
+blocking,16,14,14017
+restartBlocking,30,8,10115
+restartBlocking,30,32,39551
+restartBlocking,30,6,9111
+restartBlocking,30,5,8013
+restartBlocking,30,5,7712
+noLiveLock,30,10,8010
+noLiveLock,30,12,12717
+noLiveLock,30,12,12919
+noLiveLock,30,15,16825
+noLiveLock,30,8,6610
