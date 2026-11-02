@@ -115,7 +115,7 @@ public class Blocking {
 			}
 		}
 		stop = System.currentTimeMillis();
-		System.out.println("[DONE] Task execution after roughly "+(stop-start)+" ms finished: "+b.tasks_finished+" of "+num_taks);
+		System.out.println("[DONE] Task execution after roughly "+(stop-start)+" ms finished: "+b.tasks_finished+" of "+num_taks+" with "+Logger.deadlock_count+" deadlocks");
 	}
 	
 	/**
@@ -135,6 +135,13 @@ public class Blocking {
 				stop_range[q]  = rand.nextDouble()*max_value;
 				start_range[q] = rand.nextDouble()*stop_range[q];
 			}
+		}
+
+		private boolean isDeadlock(SQLException e) {
+			String state = e.getSQLState();
+			if (state != null && state.trim().equals("40P01")) return true; // PostgreSQL deadlock SQL state (not all DBs use this)
+			String msg = e.getMessage();
+			return msg != null && msg.toLowerCase().contains("deadlock"); // generic check (not reliable, maybe delete later)
 		}
 		
 		@Override
@@ -167,6 +174,9 @@ public class Blocking {
 				con.close();
 				System.out.println("Done task "+task+". I am finisher number "+num_finished);
 			} catch (SQLException e) {
+				if (isDeadlock(e)) {
+					Logger.deadlock_count++;
+				}
 				System.err.println("Task "+task+" "+e.getMessage());
 			}
 		}	

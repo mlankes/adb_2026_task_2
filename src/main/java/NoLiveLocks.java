@@ -123,7 +123,7 @@ public class NoLiveLocks {
             }
         }
         stop = System.currentTimeMillis();
-        System.out.println("[DONE] Task execution after roughly "+(stop-start)+" ms finished: "+b.tasks_finished+" of "+num_taks);
+        System.out.println("[DONE] Task execution after roughly "+(stop-start)+" ms finished: "+b.tasks_finished+" of "+num_taks+" with "+Logger.deadlock_count+" deadlocks");
     }
 
     /**
@@ -183,6 +183,7 @@ public class NoLiveLocks {
                         // Use exponential backoff with jitter to avoid starvation with high probability
                         long backoff = computeBackoff(retries, rand);
                         retries++;
+                        Logger.deadlock_count++;
                         Logger.logError("Task " + task + " deadlock error, retrying after backoff of " + backoff + " ms, retry count: " + retries, e);
                         try {
                             Thread.sleep(backoff);

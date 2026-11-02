@@ -122,7 +122,7 @@ public class RestartBlocking {
             }
         }
         stop = System.currentTimeMillis();
-        System.out.println("[DONE] Task execution after roughly "+(stop-start)+" ms finished: "+b.tasks_finished+" of "+num_taks);
+        System.out.println("[DONE] Task execution after roughly "+(stop-start)+" ms finished: "+b.tasks_finished+" of "+num_taks+" with "+Logger.deadlock_count+" deadlocks");
     }
 
     /**
@@ -146,6 +146,7 @@ public class RestartBlocking {
 
         @Override
         public void run() {
+            int retries = 0;
             while (true) {
                 // make use of auto-closeables
                 try (Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
@@ -169,7 +170,9 @@ public class RestartBlocking {
                 } catch (SQLException e) {
                     if (isDeadlock(e)) {
                         long backoff = 0;
-                        Logger.logError("Task " + task + " deadlock error, retrying", e);
+                        retries++;
+                        Logger.deadlock_count++;
+                        Logger.logError("Task " + task + " deadlock error, retry count: " + retries, e);
 //                        try {
 //                            Thread.sleep(backoff);
 //                        } catch (InterruptedException ie) {
