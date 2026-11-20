@@ -7,6 +7,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  *
@@ -32,14 +33,24 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 
 public class BlockingStream {
-    public static int num_taks=30;
+    //public static int num_taks=30;
     public static int num_queries_per_task = 3;
     private static final int NUM_WORKERS = 10;
     private static final long THROUGHPUT_INTERVAL_MS = 10_000L;
+    private static final long BASE_BACKOFF_MS = 10L;     // first backoff window: 0..10 ms
+    private static final long MAX_BACKOFF_MS = 1_000L;   // the window never grows beyond 0..1000 ms
 
-    Connection con;
+    final AtomicInteger retries = new AtomicInteger();   // how many aborted attempts were restarted
+
+    // Before
+    // 1-worker Serial throughput: ~70 (between 63 and 73) commits per second
+    // 10-worker concurrent: ~180 (between 175 and 185) commits per second
+    // 100-worker: ~195 commits per second
+
+    //Connection con;
     Random rand = new Random(123456);
     AtomicInteger num_tuple = new AtomicInteger(50000);
+    private static final int INITIAL_TUPLES = 50000;
     double max_value = 50.0f;
     AtomicInteger tasks_finished;
     private final AtomicInteger nextTaskId = new AtomicInteger();
@@ -83,7 +94,8 @@ public class BlockingStream {
             int[] results = ps.executeBatch();
             con.commit();
             con.close();
-            System.out.println(Arrays.toString(results));
+            //System.out.println(Arrays.toString(results));
+            System.out.println("DB has been created");
         } catch (SQLException e) {
             e.printStackTrace();
         }
@@ -133,9 +145,21 @@ public class BlockingStream {
         long elapsedNanos = System.nanoTime() - start;
         int completedDuringWindow = tasks_finished.get() - completedBefore;
         double throughput = completedDuringWindow / (elapsedNanos / 1_000_000_000.0);
-        System.out.printf("[THROUGHPUT] %.2f committed transactions/second (%d in %.2f seconds)%n",
-                throughput, completedDuringWindow, elapsedNanos / 1_000_000_000.0);
+        System.out.printf("[THROUGHPUT] %.2f committed transactions/second (%d in %.2f seconds), total retries so far: %d%n",
+                throughput, completedDuringWindow, elapsedNanos / 1_000_000_000.0, retries.get());
         return throughput;
+    }
+
+    /** Deadlock (40P01) and serialization failure (40001): safe to roll back and run again. */
+    private static boolean isRetryable(SQLException e) {
+        String state = e.getSQLState();
+        return "40P01".equals(state) || "40001".equals(state);
+    }
+
+    /** Exponential backoff with "full jitter": random sleep in [0, min(cap, base * 2^attempt)]. */
+    private static long backoffMillis(int attempt) {
+        long window = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS << Math.min(attempt, 10));
+        return ThreadLocalRandom.current().nextLong(window + 1);
     }
 
     private void submitNextTransaction() {
@@ -150,40 +174,27 @@ public class BlockingStream {
         }
     }
 
-    /**
-     * This is simply a task attempting to hold many write locks for a long time and updating major parts of the database.
-     *
-     */
+
     public class Blocker implements Runnable  {
         final int task;
+        final double decision = rand.nextDouble();   // transaction type is drawn ONCE, so a retry stays the same type
+        private List<Integer> fixedIds;              // tuple ids are drawn once and reused on every retry
 
         public Blocker(int id){
             this.task = id;
         }
 
-        private List<Integer> selectRandomTupleIds(Connection con) throws SQLException { // might be bottleneck
-            String sql = "SELECT data_id FROM blocking_data ORDER BY random() LIMIT ?";
-            List<Integer> ids = new ArrayList<>();
-
-            try (PreparedStatement ps = con.prepareStatement(sql)) {
-                ps.setInt(1, num_queries_per_task);
-
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        ids.add(rs.getInt("data_id"));
-                    }
-                }
+        private List<Integer> selectRandomTupleIds() {
+            if (fixedIds != null) return fixedIds;
+            fixedIds = new ArrayList<>(num_queries_per_task);
+            for (int i = 0; i < num_queries_per_task; i++) {
+                fixedIds.add(ThreadLocalRandom.current().nextInt(INITIAL_TUPLES));
             }
-
-            if (ids.size() < num_queries_per_task) {
-                throw new SQLException("Not enough tuples available for the transaction");
-            }
-
-            return ids;
+            return fixedIds;
         }
 
         public void readonly_multipoint_query(Connection con) throws SQLException {
-            List<Integer> ids = selectRandomTupleIds(con);
+            List<Integer> ids = selectRandomTupleIds();
             double sum = 0.0;
 
             try (PreparedStatement ps = con.prepareStatement(
@@ -200,7 +211,7 @@ public class BlockingStream {
                 }
             }
 
-            System.out.println("Task " + task + " sum of data_values: " + sum);
+            //System.out.println("Task " + task + " sum of data_values: " + sum);
         }
 
         public void insert_query(Connection con) throws SQLException {
@@ -217,13 +228,13 @@ public class BlockingStream {
                  ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     double sum = rs.getDouble(1);
-                    System.out.println("Task " + task + " sum of data_values: " + sum);
+                    //System.out.println("Task " + task + " sum of data_values: " + sum);
                 }
             }
         }
 
         public void write_query(Connection con) throws SQLException {
-            List<Integer> ids = selectRandomTupleIds(con);
+            List<Integer> ids = selectRandomTupleIds();
 
             try (PreparedStatement ps = con.prepareStatement(
                     "UPDATE blocking_data " +
@@ -239,36 +250,51 @@ public class BlockingStream {
             }
         }
 
-        public void run_sql_queries(Connection con) throws SQLException {
+        public void run_sql_queries(Connection con) throws SQLException {   // only 10% of overall runtime
             con.setAutoCommit(false);
-            con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
-            double decision = rand.nextDouble();
+            con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED); // ~25% of run_sql_queries execution time
             if (decision < 0.6) {
-                readonly_multipoint_query(con);
+                readonly_multipoint_query(con); // ~50% (multipoint query triggers full table scan)
             } else if (decision < 0.7) {
-                insert_query(con);
+                insert_query(con);              // ~5%
             } else if (decision < 0.8) {
-                full_table_scan_query(con);
+                full_table_scan_query(con);     // ~5%
             } else {
-                write_query(con);
+                write_query(con);               // ~15%
             }
         }
 
-        @Override
         public void run() {
             try (Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL)) {
-                try {
-                    run_sql_queries(con);
-                    con.commit();
-                    int num_finished = tasks_finished.incrementAndGet();
-                    System.out.println("Done task "+task+". I am finisher number "+num_finished);
-                } catch (SQLException e) {
+                int attempt = 0;
+                while (running) {
                     try {
-                        con.rollback();
-                    } catch (SQLException rollbackError) {
-                        e.addSuppressed(rollbackError);
+                        run_sql_queries(con);
+                        con.commit();
+                        int num_finished = tasks_finished.incrementAndGet();
+                        //System.out.println("Done task "+task+" after "+attempt+" retries. I am finisher number "+num_finished);
+                        break;
+                    } catch (SQLException e) {
+                        try {
+                            con.rollback();   // releases all locks BEFORE the transaction sleeps
+                        } catch (SQLException rollbackError) {
+                            e.addSuppressed(rollbackError);
+                        }
+                        if (!isRetryable(e)) {
+                            System.err.println("Task "+task+" failed permanently: "+e.getMessage());
+                            break;
+                        }
+                        retries.incrementAndGet();
+                        long sleepMs = backoffMillis(attempt);
+                        attempt++;
+                        System.err.println("Task "+task+" retry "+attempt+" in "+sleepMs+" ms ("+e.getSQLState()+")");
+                        try {
+                            Thread.sleep(sleepMs);  // Exponential backoff
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
                     }
-                    System.err.println("Task "+task+" "+e.getMessage());
                 }
             } catch (SQLException e) {
                 System.err.println("Task "+task+" "+e.getMessage());
@@ -278,3 +304,8 @@ public class BlockingStream {
         }
     }
 }
+
+// One bottleneck has been selecting the ids (selectRandomTupleIds) to be used by the multipoint read and write querys
+// they made 50% of the runtimes of these querys
+// after realizing this function locally as a List of Integers (instead of sql querys causing full table scans),
+// we could reduce their runtime share to 2.35% of the querys runtime
