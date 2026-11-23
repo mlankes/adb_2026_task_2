@@ -253,9 +253,9 @@ public class BlockingStream {
 
         double throughput = completedDuringWindow / (elapsedNanos / 1_000_000_000.0);
         int transactionCount = Math.max(1, completedDuringWindow);
-        double setupMs = setupDuring / transactionCount / 1_000_000.0;
-        double sqlMs = sqlDuring / transactionCount / 1_000_000.0;
-        double commitMs = commitDuring / transactionCount / 1_000_000.0;
+        double setupMs = (double) setupDuring / transactionCount / 1_000_000.0;
+        double sqlMs = (double) sqlDuring / transactionCount / 1_000_000.0;
+        double commitMs = (double) commitDuring / transactionCount / 1_000_000.0;
         double runtimeMs = setupMs + sqlMs + commitMs;
 
         if (!SUPPRESS_RETRY_LOGS) {
