@@ -2,6 +2,11 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -44,6 +49,9 @@ public class BlockingStream {
     private static final boolean REUSE_PREPARED_STATEMENTS = !"false".equals(System.getProperty("reusePreparedStatements"));
     private static final boolean USE_IN_CLAUSE_FOR_POINT_READS = !"false".equals(System.getProperty("useInClauseForPointReads"));
     private static final boolean PRINT_SUMS_TO_CONSOLE = !"false".equals(System.getProperty("printSumsToConsole"));             // Michael: the task says the sums have to be printed, false for clean console
+    private static final boolean SUPPRESS_RETRY_LOGS = "true".equals(System.getProperty("suppressRetryLogs"));
+    private static final int BENCHMARK_INTERVALS = Math.max(0, Integer.getInteger("benchmarkIntervals", 0));
+    private static final int BENCHMARK_WARMUP_INTERVALS = Math.max(0, Integer.getInteger("benchmarkWarmupIntervals", 1));
     private static final long THROUGHPUT_INTERVAL_MS = 10_000L;
     private static final long BASE_BACKOFF_MS = 10L;     // first backoff window: 0..10 ms
     private static final long MAX_BACKOFF_MS = 1_000L;   // the window never grows beyond 0..1000 ms
@@ -55,6 +63,7 @@ public class BlockingStream {
     final AtomicLong commitNanos = new AtomicLong();
 
     final AtomicInteger retries = new AtomicInteger();   // how many aborted attempts were restarted
+    final AtomicInteger failures = new AtomicInteger();
 
     // Before
     // 1-worker Serial throughput: ~70 (between 63 and 73) commits per second
@@ -196,8 +205,13 @@ public class BlockingStream {
         System.out.println("[STARTED] Continuous stream with " + NUM_WORKERS + " workers.");
         try {
             try {
-                while (b.running) {
-                    b.measureThroughput(THROUGHPUT_INTERVAL_MS);
+                int interval = 0;
+                int totalIntervals = BENCHMARK_INTERVALS + BENCHMARK_WARMUP_INTERVALS;
+                while (b.running && (BENCHMARK_INTERVALS == 0 || interval < totalIntervals)) {
+                    b.measureThroughput(
+                            THROUGHPUT_INTERVAL_MS,
+                            BENCHMARK_INTERVALS == 0 || interval >= BENCHMARK_WARMUP_INTERVALS);
+                    interval++;
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -216,30 +230,59 @@ public class BlockingStream {
      * @return committed transactions per second
      * @throws InterruptedException if the benchmark is interrupted while measuring
      */
-    public double measureThroughput(long intervalMillis) throws InterruptedException {
+    public double measureThroughput(long intervalMillis, boolean recordResult) throws InterruptedException {
         if (intervalMillis <= 0) {
             throw new IllegalArgumentException("The measurement interval must be positive");
         }
 
         int completedBefore = tasks_finished.get();
+        long setupBefore = setupNanos.get();
+        long sqlBefore = sqlNanos.get();
+        long commitBefore = commitNanos.get();
+        int retriesBefore = retries.get();
+        int failuresBefore = failures.get();
         long start = System.nanoTime();
         Thread.sleep(intervalMillis);
         long elapsedNanos = System.nanoTime() - start;
         int completedDuringWindow = tasks_finished.get() - completedBefore;
+        long setupDuring = setupNanos.get() - setupBefore;
+        long sqlDuring = sqlNanos.get() - sqlBefore;
+        long commitDuring = commitNanos.get() - commitBefore;
+        int retriesDuring = retries.get() - retriesBefore;
+        int failuresDuring = failures.get() - failuresBefore;
 
-        // Michael: prints where the time goes
-        double sum = connectNanos.get() + setupNanos.get() + sqlNanos.get() + commitNanos.get();
-        System.out.printf("[TIME] connect %.1f %%, setup %.1f %%, sql %.1f %%, commit %.1f %%%n",
-                100 * connectNanos.get() / sum, 100 * setupNanos.get() / sum,
-                100 * sqlNanos.get() / sum, 100 * commitNanos.get() / sum);
-        // Michael: running time of one transaction without the connection (the task says to focus on this)
-        double committed = Math.max(1, tasks_finished.get());
-        System.out.printf("[RUNTIME] %.3f ms per transaction without connect (setup %.3f ms, sql %.3f ms, commit %.3f ms)%n",
-                (setupNanos.get() + sqlNanos.get() + commitNanos.get()) / committed / 1_000_000.0, setupNanos.get() / committed / 1_000_000.0,
-                sqlNanos.get() / committed / 1_000_000.0, commitNanos.get() / committed / 1_000_000.0);
         double throughput = completedDuringWindow / (elapsedNanos / 1_000_000_000.0);
-        System.out.printf("[THROUGHPUT] %.2f committed transactions/second (%d in %.2f seconds), total retries so far: %d%n",
-                throughput, completedDuringWindow, elapsedNanos / 1_000_000_000.0, retries.get());
+        int transactionCount = Math.max(1, completedDuringWindow);
+        double setupMs = setupDuring / transactionCount / 1_000_000.0;
+        double sqlMs = sqlDuring / transactionCount / 1_000_000.0;
+        double commitMs = commitDuring / transactionCount / 1_000_000.0;
+        double runtimeMs = setupMs + sqlMs + commitMs;
+
+        if (!SUPPRESS_RETRY_LOGS) {
+            System.out.printf("[TIME] setup %.3f ms, sql %.3f ms, commit %.3f ms%n",
+                    setupMs, sqlMs, commitMs);
+            System.out.printf("[RUNTIME] %.3f ms per committed transaction (setup %.3f ms, sql %.3f ms, commit %.3f ms)%n",
+                    runtimeMs, setupMs, sqlMs, commitMs);
+            System.out.printf("[THROUGHPUT] %.2f committed transactions/second (%d in %.2f seconds), retries: %d, failures: %d%n",
+                    throughput, completedDuringWindow, elapsedNanos / 1_000_000_000.0,
+                    retriesDuring, failuresDuring);
+        }
+
+        String resultFile = System.getProperty("benchmarkResultFile");
+        if (recordResult && resultFile != null) {
+            try {
+                Files.writeString(
+                        Path.of(resultFile),
+                        String.format(Locale.ROOT, "%.6f,%.6f,%.6f,%.6f,%d,%d%n",
+                                throughput, setupMs, sqlMs, commitMs,
+                                retriesDuring, failuresDuring),
+                        StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                throw new IllegalStateException("Could not write benchmark result file: " + resultFile, e);
+            }
+        }
         return throughput;
 
 
@@ -456,13 +499,18 @@ public class BlockingStream {
                             e.addSuppressed(rollbackError);
                         }
                         if (!isRetryable(e)) {
-                            System.err.println("Task "+task+" failed permanently: "+e.getMessage());
+                            failures.incrementAndGet();
+                            if (!SUPPRESS_RETRY_LOGS) {
+                                System.err.println("Task "+task+" failed permanently: "+e.getMessage());
+                            }
                             break;
                         }
                         retries.incrementAndGet();
                         long sleepMs = backoffMillis(attempt);
                         attempt++;
-                        System.err.println("Task "+task+" retry "+attempt+" in "+sleepMs+" ms ("+e.getSQLState()+")");
+                        if (!SUPPRESS_RETRY_LOGS) {
+                            System.err.println("Task "+task+" retry "+attempt+" in "+sleepMs+" ms ("+e.getSQLState()+")");
+                        }
                         try {
                             Thread.sleep(sleepMs);  // Exponential backoff
                         } catch (InterruptedException ie) {
@@ -472,7 +520,9 @@ public class BlockingStream {
                     }
                 }
             } catch (SQLException e) {
-                System.err.println("Task "+task+" "+e.getMessage());
+                if (!SUPPRESS_RETRY_LOGS) {
+                    System.err.println("Task "+task+" "+e.getMessage());
+                }
             } finally {
                 submitNextTransaction();
             }
@@ -508,18 +558,23 @@ public class BlockingStream {
                             }
 
                             if (!isRetryable(e)) {
-                                System.err.println(
-                                        "Task " + transaction.task +
-                                        " failed permanently: " + e.getMessage());
+                                failures.incrementAndGet();
+                                if (!SUPPRESS_RETRY_LOGS) {
+                                    System.err.println(
+                                            "Task " + transaction.task +
+                                            " failed permanently: " + e.getMessage());
+                                }
                                 break;
                             }
 
                             retries.incrementAndGet();
                             long sleepMs = backoffMillis(attempt++);
-                            System.err.println(
-                                    "Task " + transaction.task +
-                                    " retry " + attempt + " in " + sleepMs +
-                                    " ms (" + e.getSQLState() + ")");
+                            if (!SUPPRESS_RETRY_LOGS) {
+                                System.err.println(
+                                        "Task " + transaction.task +
+                                        " retry " + attempt + " in " + sleepMs +
+                                        " ms (" + e.getSQLState() + ")");
+                            }
                             try {
                                 Thread.sleep(sleepMs);
                             } catch (InterruptedException ie) {
@@ -530,7 +585,10 @@ public class BlockingStream {
                     }
                 }
             } catch (SQLException e) {
-                System.err.println("Worker failed: " + e.getMessage());
+                failures.incrementAndGet();
+                if (!SUPPRESS_RETRY_LOGS) {
+                    System.err.println("Worker failed: " + e.getMessage());
+                }
             }
         }
     }
