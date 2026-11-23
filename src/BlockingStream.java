@@ -8,6 +8,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;   // Michael: needed for the timers
 
 /**
  *
@@ -35,10 +36,21 @@ import java.util.concurrent.ThreadLocalRandom;
 public class BlockingStream {
     //public static int num_taks=30;
     public static int num_queries_per_task = 3;
-    private static final int NUM_WORKERS = 10;
+    private static final int NUM_WORKERS = Integer.getInteger("numberOfWorkers", 10);   // Michael: Benchmark.java can pass -DnumberOfWorkers=1 for the serial run, default is still 10
+    // Michael: switches for the bottleneck fixes. Default is on. Benchmark.java turns them off with e.g. -DsendUpdatesAsOneBatch=false
+    // all false = behaviour of the original code
+    private static final boolean SKIP_ISOLATION_LEVEL_CALL = !"false".equals(System.getProperty("skipIsolationLevelCall"));     // Michael: Bottleneck fix 1, read committed is the default in PostgreSQL, so it is not sent for every transaction
+    private static final boolean SEND_UPDATES_AS_ONE_BATCH = !"false".equals(System.getProperty("sendUpdatesAsOneBatch"));       // Michael: Bottleneck fix 2, the 3 updates go to the db in one round trip
+    private static final boolean PRINT_SUMS_TO_CONSOLE = !"false".equals(System.getProperty("printSumsToConsole"));             // Michael: the task says the sums have to be printed, false for clean console
     private static final long THROUGHPUT_INTERVAL_MS = 10_000L;
     private static final long BASE_BACKOFF_MS = 10L;     // first backoff window: 0..10 ms
     private static final long MAX_BACKOFF_MS = 1_000L;   // the window never grows beyond 0..1000 ms
+
+    // Michael: added for bottleneck measurements
+    final AtomicLong connectNanos = new AtomicLong();
+    final AtomicLong setupNanos = new AtomicLong();
+    final AtomicLong sqlNanos = new AtomicLong();
+    final AtomicLong commitNanos = new AtomicLong();
 
     final AtomicInteger retries = new AtomicInteger();   // how many aborted attempts were restarted
 
@@ -144,10 +156,23 @@ public class BlockingStream {
         Thread.sleep(intervalMillis);
         long elapsedNanos = System.nanoTime() - start;
         int completedDuringWindow = tasks_finished.get() - completedBefore;
+
+        // Michael: prints where the time goes
+        double sum = connectNanos.get() + setupNanos.get() + sqlNanos.get() + commitNanos.get();
+        System.out.printf("[TIME] connect %.1f %%, setup %.1f %%, sql %.1f %%, commit %.1f %%%n",
+                100 * connectNanos.get() / sum, 100 * setupNanos.get() / sum,
+                100 * sqlNanos.get() / sum, 100 * commitNanos.get() / sum);
+        // Michael: running time of one transaction without the connection (the task says to focus on this)
+        double committed = Math.max(1, tasks_finished.get());
+        System.out.printf("[RUNTIME] %.3f ms per transaction without connect (setup %.3f ms, sql %.3f ms, commit %.3f ms)%n",
+                (setupNanos.get() + sqlNanos.get() + commitNanos.get()) / committed / 1_000_000.0, setupNanos.get() / committed / 1_000_000.0,
+                sqlNanos.get() / committed / 1_000_000.0, commitNanos.get() / committed / 1_000_000.0);
         double throughput = completedDuringWindow / (elapsedNanos / 1_000_000_000.0);
         System.out.printf("[THROUGHPUT] %.2f committed transactions/second (%d in %.2f seconds), total retries so far: %d%n",
                 throughput, completedDuringWindow, elapsedNanos / 1_000_000_000.0, retries.get());
         return throughput;
+
+
     }
 
     /** Deadlock (40P01) and serialization failure (40001): safe to roll back and run again. */
@@ -187,8 +212,12 @@ public class BlockingStream {
         private List<Integer> selectRandomTupleIds() {
             if (fixedIds != null) return fixedIds;
             fixedIds = new ArrayList<>(num_queries_per_task);
-            for (int i = 0; i < num_queries_per_task; i++) {
-                fixedIds.add(ThreadLocalRandom.current().nextInt(INITIAL_TUPLES));
+            // Michael: distinct tuples
+            while (fixedIds.size() < num_queries_per_task) {
+                int id = ThreadLocalRandom.current().nextInt(INITIAL_TUPLES);
+                if (!fixedIds.contains(id)) {
+                    fixedIds.add(id);
+                }
             }
             return fixedIds;
         }
@@ -211,7 +240,9 @@ public class BlockingStream {
                 }
             }
 
-            //System.out.println("Task " + task + " sum of data_values: " + sum);
+            if (PRINT_SUMS_TO_CONSOLE) {
+                System.out.println("Task " + task + " sum of data_values: " + sum);
+            }
         }
 
         public void insert_query(Connection con) throws SQLException {
@@ -228,7 +259,9 @@ public class BlockingStream {
                  ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     double sum = rs.getDouble(1);
-                    //System.out.println("Task " + task + " sum of data_values: " + sum);
+                    if (PRINT_SUMS_TO_CONSOLE) {
+                        System.out.println("Task " + task + " sum of data_values: " + sum);
+                    }
                 }
             }
         }
@@ -245,14 +278,29 @@ public class BlockingStream {
                     ps.setDouble(1, rand.nextDouble() * max_value);
                     ps.setInt(2, task);
                     ps.setInt(3, id);
-                    ps.executeUpdate();
+                    // Michael: Bottleneck fix 2, same 3 updates in the same order, but sent together
+                    if (SEND_UPDATES_AS_ONE_BATCH) {        
+                        ps.addBatch();
+                    } else {
+                        ps.executeUpdate();
+                    }
+                }
+                if (SEND_UPDATES_AS_ONE_BATCH) {
+                    ps.executeBatch();
                 }
             }
         }
 
         public void run_sql_queries(Connection con) throws SQLException {   // only 10% of overall runtime
+            long t0 = System.nanoTime();   // Michael: setup timer
             con.setAutoCommit(false);
-            con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED); // ~25% of run_sql_queries execution time
+            // Michael: Bottleneck fix 1, this call costs one round trip for every transaction.
+            // read committed is already the default in PostgreSQL, so it can be skipped
+            if (!SKIP_ISOLATION_LEVEL_CALL) {
+                con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED); // ~25% of run_sql_queries execution time
+            }
+            long t1 = System.nanoTime();
+            setupNanos.addAndGet(t1 - t0);
             if (decision < 0.6) {
                 readonly_multipoint_query(con); // ~50% (multipoint query triggers full table scan)
             } else if (decision < 0.7) {
@@ -262,15 +310,21 @@ public class BlockingStream {
             } else {
                 write_query(con);               // ~15%
             }
+
+            sqlNanos.addAndGet(System.nanoTime() - t1);
         }
 
         public void run() {
+            long c0 = System.nanoTime();   // Michael: connect timer
             try (Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL)) {
+                connectNanos.addAndGet(System.nanoTime() - c0);
                 int attempt = 0;
                 while (running) {
                     try {
                         run_sql_queries(con);
+                        long m0 = System.nanoTime();
                         con.commit();
+                        commitNanos.addAndGet(System.nanoTime() - m0);
                         int num_finished = tasks_finished.incrementAndGet();
                         //System.out.println("Done task "+task+" after "+attempt+" retries. I am finisher number "+num_finished);
                         break;
@@ -309,3 +363,9 @@ public class BlockingStream {
 // they made 50% of the runtimes of these querys
 // after realizing this function locally as a List of Integers (instead of sql querys causing full table scans),
 // we could reduce their runtime share to 2.35% of the querys runtime
+
+// Michael: bottleneck analysis & benchmarks
+// 1. timers in the code: 84 % of the time was opening the connection, according to assignment 3 we should not focus on connection related issues?
+// 2. EXPLAIN ANALYZE in psql: the full table scan is a Seq Scan over all rows, the read by id is an Index Scan
+// 3. the connection is not optimized, the task says so. Fixes: no isolation level call per transaction, the 3 updates as one batch
+// 4. inside a transaction almost all time is sql (mostly the full scan), and we are not allowed to change that query
