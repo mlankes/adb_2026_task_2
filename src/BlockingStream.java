@@ -41,6 +41,8 @@ public class BlockingStream {
     // all false = behaviour of the original code
     private static final boolean SKIP_ISOLATION_LEVEL_CALL = !"false".equals(System.getProperty("skipIsolationLevelCall"));     // Michael: Bottleneck fix 1, read committed is the default in PostgreSQL, so it is not sent for every transaction
     private static final boolean SEND_UPDATES_AS_ONE_BATCH = !"false".equals(System.getProperty("sendUpdatesAsOneBatch"));       // Michael: Bottleneck fix 2, the 3 updates go to the db in one round trip
+    private static final boolean REUSE_PREPARED_STATEMENTS = !"false".equals(System.getProperty("reusePreparedStatements"));
+    private static final boolean USE_IN_CLAUSE_FOR_POINT_READS = !"false".equals(System.getProperty("useInClauseForPointReads"));
     private static final boolean PRINT_SUMS_TO_CONSOLE = !"false".equals(System.getProperty("printSumsToConsole"));             // Michael: the task says the sums have to be printed, false for clean console
     private static final long THROUGHPUT_INTERVAL_MS = 10_000L;
     private static final long BASE_BACKOFF_MS = 10L;     // first backoff window: 0..10 ms
@@ -68,6 +70,68 @@ public class BlockingStream {
     private final AtomicInteger nextTaskId = new AtomicInteger();
     private volatile boolean running = true;
     private ExecutorService executor;
+
+    private static class StatementCache implements AutoCloseable {
+        private final Connection connection;
+        private final Map<String, PreparedStatement> statements = new HashMap<>();
+
+        StatementCache(Connection connection) {
+            this.connection = connection;
+        }
+
+        PreparedStatement get(String name) throws SQLException {
+            PreparedStatement statement = statements.get(name);
+            if (statement != null) {
+                return statement;
+            }
+
+            String sql;
+            switch (name) {
+                case "point-read":
+                    sql = "SELECT data_value FROM blocking_data WHERE data_id = ?";
+                    break;
+                case "point-read-in":
+                    sql = "SELECT sum(data_value) FROM blocking_data " +
+                            "WHERE data_id IN (?, ?, ?)";
+                    break;
+                case "insert":
+                    sql = "INSERT INTO blocking_data VALUES (?, ?, ?)";
+                    break;
+                case "full-scan":
+                    sql = "SELECT sum(data_value) FROM blocking_data";
+                    break;
+                case "update":
+                    sql = "UPDATE blocking_data SET data_value = ?, modified_by = ? " +
+                            "WHERE data_id = ?";
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown statement: " + name);
+            }
+
+            statement = connection.prepareStatement(sql);
+            statements.put(name, statement);
+            return statement;
+        }
+
+        @Override
+        public void close() throws SQLException {
+            SQLException failure = null;
+            for (PreparedStatement statement : statements.values()) {
+                try {
+                    statement.close();
+                } catch (SQLException e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
 
     public BlockingStream(){
         tasks_finished = new AtomicInteger(0);
@@ -119,8 +183,14 @@ public class BlockingStream {
         b.createDB();
 
         b.executor = Executors.newFixedThreadPool(NUM_WORKERS);
-        for (int worker = 0; worker < NUM_WORKERS; worker++) {
-            b.submitNextTransaction();
+        if (REUSE_PREPARED_STATEMENTS) {
+            for (int worker = 0; worker < NUM_WORKERS; worker++) {
+                b.executor.execute(b.new Worker());
+            }
+        } else {
+            for (int worker = 0; worker < NUM_WORKERS; worker++) {
+                b.submitNextTransaction();
+            }
         }
 
         System.out.println("[STARTED] Continuous stream with " + NUM_WORKERS + " workers.");
@@ -222,20 +292,52 @@ public class BlockingStream {
             return fixedIds;
         }
 
-        public void readonly_multipoint_query(Connection con) throws SQLException {
+        public void readonly_multipoint_query(Connection con, StatementCache cache) throws SQLException {
             List<Integer> ids = selectRandomTupleIds();
             double sum = 0.0;
 
-            try (PreparedStatement ps = con.prepareStatement(
-                    "SELECT data_value FROM blocking_data WHERE data_id = ?")) {
-
-                for (int id : ids) {
-                    ps.setInt(1, id);
-
+            if (USE_IN_CLAUSE_FOR_POINT_READS) {
+                PreparedStatement ps = cache != null
+                        ? cache.get("point-read-in")
+                        : con.prepareStatement(
+                                "SELECT sum(data_value) FROM blocking_data " +
+                                "WHERE data_id IN (?, ?, ?)");
+                for (int i = 0; i < ids.size(); i++) {
+                    ps.setInt(i + 1, ids.get(i));
+                }
+                if (cache == null) {
+                    try (PreparedStatement closeable = ps;
+                         ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            sum = rs.getDouble(1);
+                        }
+                    }
+                } else {
                     try (ResultSet rs = ps.executeQuery()) {
                         if (rs.next()) {
-                            sum += rs.getDouble("data_value");
+                            sum = rs.getDouble(1);
                         }
+                    }
+                }
+            } else {
+                PreparedStatement ps = cache != null
+                        ? cache.get("point-read")
+                        : con.prepareStatement(
+                                "SELECT data_value FROM blocking_data WHERE data_id = ?");
+                try {
+                    for (int id : ids) {
+                        ps.setInt(1, id);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            if (rs.next()) {
+                                sum += rs.getDouble("data_value");
+                            }
+                        }
+                    }
+                } finally {
+                    if (cache == null) {
+                        ps.close();
+                    } else if (SEND_UPDATES_AS_ONE_BATCH) {
+                        ps.clearBatch();
                     }
                 }
             }
@@ -245,35 +347,50 @@ public class BlockingStream {
             }
         }
 
-        public void insert_query(Connection con) throws SQLException {
-            try (PreparedStatement ps = con.prepareStatement("INSERT INTO blocking_data VALUES (?, ?, ?)")) {
+        public void insert_query(Connection con, StatementCache cache) throws SQLException {
+            PreparedStatement ps = cache != null
+                    ? cache.get("insert")
+                    : con.prepareStatement("INSERT INTO blocking_data VALUES (?, ?, ?)");
+            try {
                 int id = num_tuple.getAndIncrement(); // Do this client-side since this needs to be exactly one more than the previous maximum id (for now, might be potential for optimization)
                 ps.setInt(1, id);
                 ps.setDouble(2,rand.nextDouble()*max_value);
                 ps.setInt(3, task);
                 ps.executeUpdate();
+            } finally {
+                if (cache == null) {
+                    ps.close();
+                }
             }
         }
-        public void full_table_scan_query(Connection con) throws SQLException {
-            try (PreparedStatement ps = con.prepareStatement("SELECT sum(data_value) FROM blocking_data");
-                 ResultSet rs = ps.executeQuery()) {
+        public void full_table_scan_query(Connection con, StatementCache cache) throws SQLException {
+            PreparedStatement ps = cache != null
+                    ? cache.get("full-scan")
+                    : con.prepareStatement("SELECT sum(data_value) FROM blocking_data");
+            try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     double sum = rs.getDouble(1);
                     if (PRINT_SUMS_TO_CONSOLE) {
                         System.out.println("Task " + task + " sum of data_values: " + sum);
                     }
                 }
+            } finally {
+                if (cache == null) {
+                    ps.close();
+                }
             }
         }
 
-        public void write_query(Connection con) throws SQLException {
+        public void write_query(Connection con, StatementCache cache) throws SQLException {
             List<Integer> ids = selectRandomTupleIds();
 
-            try (PreparedStatement ps = con.prepareStatement(
-                    "UPDATE blocking_data " +
+            PreparedStatement ps = cache != null
+                    ? cache.get("update")
+                    : con.prepareStatement(
+                            "UPDATE blocking_data " +
                             "SET data_value = ?, modified_by = ? " +
-                            "WHERE data_id = ?")) {
-
+                            "WHERE data_id = ?");
+            try {
                 for (int id : ids) {
                     ps.setDouble(1, rand.nextDouble() * max_value);
                     ps.setInt(2, task);
@@ -288,10 +405,14 @@ public class BlockingStream {
                 if (SEND_UPDATES_AS_ONE_BATCH) {
                     ps.executeBatch();
                 }
+            } finally {
+                if (cache == null) {
+                    ps.close();
+                }
             }
         }
 
-        public void run_sql_queries(Connection con) throws SQLException {   // only 10% of overall runtime
+        public void run_sql_queries(Connection con, StatementCache cache) throws SQLException {
             long t0 = System.nanoTime();   // Michael: setup timer
             con.setAutoCommit(false);
             // Michael: Bottleneck fix 1, this call costs one round trip for every transaction.
@@ -302,13 +423,13 @@ public class BlockingStream {
             long t1 = System.nanoTime();
             setupNanos.addAndGet(t1 - t0);
             if (decision < 0.6) {
-                readonly_multipoint_query(con); // ~50% (multipoint query triggers full table scan)
+                readonly_multipoint_query(con, cache);
             } else if (decision < 0.7) {
-                insert_query(con);              // ~5%
+                insert_query(con, cache);
             } else if (decision < 0.8) {
-                full_table_scan_query(con);     // ~5%
+                full_table_scan_query(con, cache);
             } else {
-                write_query(con);               // ~15%
+                write_query(con, cache);
             }
 
             sqlNanos.addAndGet(System.nanoTime() - t1);
@@ -321,7 +442,7 @@ public class BlockingStream {
                 int attempt = 0;
                 while (running) {
                     try {
-                        run_sql_queries(con);
+                        run_sql_queries(con, null);
                         long m0 = System.nanoTime();
                         con.commit();
                         commitNanos.addAndGet(System.nanoTime() - m0);
@@ -354,6 +475,62 @@ public class BlockingStream {
                 System.err.println("Task "+task+" "+e.getMessage());
             } finally {
                 submitNextTransaction();
+            }
+        }
+    }
+
+    private class Worker implements Runnable {
+        @Override
+        public void run() {
+            long c0 = System.nanoTime();
+            try (Connection con =
+                         ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
+                 StatementCache cache = new StatementCache(con)) {
+                connectNanos.addAndGet(System.nanoTime() - c0);
+
+                while (running) {
+                    Blocker transaction = new Blocker(nextTaskId.getAndIncrement());
+                    int attempt = 0;
+
+                    while (running) {
+                        try {
+                            transaction.run_sql_queries(con, cache);
+                            long m0 = System.nanoTime();
+                            con.commit();
+                            commitNanos.addAndGet(System.nanoTime() - m0);
+                            tasks_finished.incrementAndGet();
+                            break;
+                        } catch (SQLException e) {
+                            try {
+                                con.rollback();
+                            } catch (SQLException rollbackError) {
+                                e.addSuppressed(rollbackError);
+                            }
+
+                            if (!isRetryable(e)) {
+                                System.err.println(
+                                        "Task " + transaction.task +
+                                        " failed permanently: " + e.getMessage());
+                                break;
+                            }
+
+                            retries.incrementAndGet();
+                            long sleepMs = backoffMillis(attempt++);
+                            System.err.println(
+                                    "Task " + transaction.task +
+                                    " retry " + attempt + " in " + sleepMs +
+                                    " ms (" + e.getSQLState() + ")");
+                            try {
+                                Thread.sleep(sleepMs);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                return;
+                            }
+                        }
+                    }
+                }
+            } catch (SQLException e) {
+                System.err.println("Worker failed: " + e.getMessage());
             }
         }
     }

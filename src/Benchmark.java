@@ -16,17 +16,19 @@ public class Benchmark {
 
     public static void main(String[] args) throws Exception {
         for (int round = 1; round <= ROUNDS; round++) {
-            run("original",                  10, false, false, false);
-            run("+ no isolation call",       10, true,  false, false);
-            run("+ batch (improved)",        10, true,  true,  false);
-            run("+ sums printed",            10, true,  true,  true);
-            run("serial, original",           1, false, false, false);
-            run("serial, improved",           1, true,  true,  false);
+            run("original",                  10, false, false, false, false, false);
+            run("+ no isolation call",       10, true,  false, false, false, false);
+            run("+ batch",                   10, true,  true,  false, false, false);
+            run("+ prepared cache",          10, true,  true,  true,  false, false);
+            run("+ IN point reads",          10, true,  true,  true,  true,  false);
+            run("+ sums printed",            10, true,  true,  true,  true,  true);
+            run("serial, original",           1, false, false, false, false, false);
+            run("serial, improved",           1, true,  true,  true,  true,  false);
             for (int workers : new int[] {2, 4, 8, 16}) {
-                run("original", workers, false, false, false);
+                run("original", workers, false, false, false, false, false);
             }
             for (int workers : new int[] {2, 4, 8, 16}) {
-                run("improved", workers, true, true, false);
+                run("improved", workers, true, true, true, true, false);
             }
         }
         print("THROUGHPUT in tx/s", throughput, "%9.0f");
@@ -34,11 +36,14 @@ public class Benchmark {
     }
 
     static void run(String name, int numberOfWorkers, boolean skipIsolationLevelCall, boolean sendUpdatesAsOneBatch,
+                    boolean reusePreparedStatements, boolean useInClauseForPointReads,
                     boolean printSumsToConsole) throws Exception {
         String java = System.getProperty("java.home") + "/bin/java";
         ProcessBuilder builder = new ProcessBuilder(java,
                 "-DnumberOfWorkers=" + numberOfWorkers, "-DskipIsolationLevelCall=" + skipIsolationLevelCall,
                 "-DsendUpdatesAsOneBatch=" + sendUpdatesAsOneBatch, "-DprintSumsToConsole=" + printSumsToConsole,
+                "-DreusePreparedStatements=" + reusePreparedStatements,
+                "-DuseInClauseForPointReads=" + useInClauseForPointReads,
                 "-cp", System.getProperty("java.class.path"), "BlockingStream");
         builder.redirectErrorStream(true);
         Process stream = builder.start();
