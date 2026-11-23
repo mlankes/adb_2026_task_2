@@ -327,7 +327,7 @@ public class BlockingStream {
             fixedIds = new ArrayList<>(num_queries_per_task);
             // Michael: distinct tuples
             while (fixedIds.size() < num_queries_per_task) {
-                int id = ThreadLocalRandom.current().nextInt(INITIAL_TUPLES);
+                int id = ThreadLocalRandom.current().nextInt(0, num_tuple.get());
                 if (!fixedIds.contains(id)) {
                     fixedIds.add(id);
                 }
